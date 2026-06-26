@@ -1,0 +1,12 @@
+torch
+transformers
+datasets
+tqdm
+numpy
+sentencepiece
+accelerate
+safetensors
+lm-eval
+wandb
+python-dotenv
+scikit-learn

@@ -1,0 +1,3 @@
+[submodule "SqueezeLLM-gradients"]
+	path = SqueezeLLM-gradients
+	url = https://github.com/kssteven418/SqueezeLLM-gradients.git
