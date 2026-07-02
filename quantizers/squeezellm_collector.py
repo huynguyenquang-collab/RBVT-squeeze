@@ -29,6 +29,11 @@ def _env_flag(name: str, default: str = "0") -> bool:
     return os.environ.get(name, default).lower() in {"1", "true", "yes", "on"}
 
 
+def _is_cuda_oom(error: BaseException) -> bool:
+    message = str(error).lower()
+    return isinstance(error, torch.cuda.OutOfMemoryError) or "cuda out of memory" in message
+
+
 def _squeezellm_linears(model) -> list[tuple[str, nn.Linear]]:
     if not hasattr(model, "model") or not hasattr(model.model, "layers"):
         raise TypeError("SqueezeLLM Fisher collection currently requires a Llama model")
@@ -147,11 +152,16 @@ def collect_squeezellm_fisher(
     accum_device = os.environ.get("SQUEEZELLM_FISHER_ACCUM_DEVICE", "gpu").lower()
     if accum_device not in {"gpu", "cpu"}:
         raise ValueError("SQUEEZELLM_FISHER_ACCUM_DEVICE must be 'gpu' or 'cpu'")
-    grad_checkpointing = _env_flag("SQUEEZELLM_FISHER_GRAD_CHECKPOINTING", "0")
+    grad_checkpointing = _env_flag("SQUEEZELLM_FISHER_GRAD_CHECKPOINTING", "1")
     if hasattr(model, "config"):
         model.config.use_cache = False
-    if grad_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
+    if hasattr(model, "gradient_checkpointing_enable"):
+        if grad_checkpointing:
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+        elif hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
     print(
         "SqueezeLLM Fisher accumulation: "
         f"{accum_device} | gradient_checkpointing={grad_checkpointing} | "
@@ -162,6 +172,81 @@ def collect_squeezellm_fisher(
     model.train()
 
     layers = {}
+    def collect_group(pending: list[int], checkpoint_retry: bool = False):
+        if checkpoint_retry and hasattr(model, "gradient_checkpointing_enable"):
+            print("Retrying Fisher group with gradient checkpointing enabled after CUDA OOM")
+            model.gradient_checkpointing_enable()
+            if hasattr(model, "enable_input_require_grads"):
+                model.enable_input_require_grads()
+
+        selected = []
+        handles = []
+        cpu_accum = {}
+        try:
+            for layer_idx in pending:
+                for layer_name, module in layer_modules[layer_idx]:
+                    module.weight.requires_grad_(True)
+                    module.weight.grad = None
+                    selected.append((layer_name, module))
+                    if accum_device == "cpu":
+                        cpu_accum[layer_name] = torch.zeros_like(
+                            module.weight,
+                            dtype=torch.float32,
+                            device="cpu",
+                        )
+
+                        def make_cpu_hook(target_name):
+                            def hook(grad):
+                                cpu_accum[target_name].add_(grad.detach().float().cpu().square())
+                                return torch.zeros_like(grad)
+
+                            return hook
+
+                        handles.append(module.weight.register_hook(make_cpu_hook(layer_name)))
+                    else:
+                        handles.append(module.weight.register_hook(square_grad_hook))
+
+            group_label = (
+                str(pending[0])
+                if len(pending) == 1
+                else f"{pending[0]}-{pending[-1]}"
+            )
+            model.zero_grad(set_to_none=True)
+            for step, data in enumerate(
+                tqdm(dataloader, desc=f"Collecting SqueezeLLM Fisher layers {group_label}"),
+                start=1,
+            ):
+                input_ids = data[0].to(device)
+                outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+                outputs.loss.backward()
+                if accum_device == "cpu":
+                    for _, module in selected:
+                        module.weight.grad = None
+                    model.zero_grad(set_to_none=True)
+                del input_ids, outputs
+                if torch.cuda.is_available() and step % 32 == 0:
+                    torch.cuda.empty_cache()
+
+            for layer_name, module in selected:
+                if accum_device == "cpu":
+                    fisher = cpu_accum[layer_name]
+                else:
+                    if module.weight.grad is None:
+                        raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
+                    fisher = module.weight.grad.detach().float().cpu()
+                filename = layer_name.replace(".", "_") + ".pt"
+                torch.save(fisher, output_dir / filename)
+                layers[f"{layer_name}.weight"] = filename
+        finally:
+            for handle in handles:
+                handle.remove()
+            for _, module in selected:
+                module.weight.requires_grad_(False)
+                module.weight.grad = None
+            model.zero_grad(set_to_none=True)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
     try:
         for group in _layer_groups(len(layer_modules), layers_per_pass):
             pending = []
@@ -177,73 +262,12 @@ def collect_squeezellm_fisher(
             if not pending:
                 continue
 
-            selected = []
-            handles = []
-            cpu_accum = {}
             try:
-                for layer_idx in pending:
-                    for layer_name, module in layer_modules[layer_idx]:
-                        module.weight.requires_grad_(True)
-                        module.weight.grad = None
-                        selected.append((layer_name, module))
-                        if accum_device == "cpu":
-                            cpu_accum[layer_name] = torch.zeros_like(
-                                module.weight,
-                                dtype=torch.float32,
-                                device="cpu",
-                            )
-
-                            def make_cpu_hook(target_name):
-                                def hook(grad):
-                                    cpu_accum[target_name].add_(grad.detach().float().cpu().square())
-                                    return torch.zeros_like(grad)
-
-                                return hook
-
-                            handles.append(module.weight.register_hook(make_cpu_hook(layer_name)))
-                        else:
-                            handles.append(module.weight.register_hook(square_grad_hook))
-
-                group_label = (
-                    str(pending[0])
-                    if len(pending) == 1
-                    else f"{pending[0]}-{pending[-1]}"
-                )
-                model.zero_grad(set_to_none=True)
-                for step, data in enumerate(
-                    tqdm(dataloader, desc=f"Collecting SqueezeLLM Fisher layers {group_label}"),
-                    start=1,
-                ):
-                    input_ids = data[0].to(device)
-                    outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
-                    outputs.loss.backward()
-                    if accum_device == "cpu":
-                        for _, module in selected:
-                            module.weight.grad = None
-                        model.zero_grad(set_to_none=True)
-                    del input_ids, outputs
-                    if torch.cuda.is_available() and step % 32 == 0:
-                        torch.cuda.empty_cache()
-
-                for layer_name, module in selected:
-                    if accum_device == "cpu":
-                        fisher = cpu_accum[layer_name]
-                    else:
-                        if module.weight.grad is None:
-                            raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
-                        fisher = module.weight.grad.detach().float().cpu()
-                    filename = layer_name.replace(".", "_") + ".pt"
-                    torch.save(fisher, output_dir / filename)
-                    layers[f"{layer_name}.weight"] = filename
-            finally:
-                for handle in handles:
-                    handle.remove()
-                for _, module in selected:
-                    module.weight.requires_grad_(False)
-                    module.weight.grad = None
-                model.zero_grad(set_to_none=True)
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
+                collect_group(pending)
+            except RuntimeError as error:
+                if grad_checkpointing or not _is_cuda_oom(error):
+                    raise
+                collect_group(pending, checkpoint_retry=True)
     finally:
         if grad_checkpointing and hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
