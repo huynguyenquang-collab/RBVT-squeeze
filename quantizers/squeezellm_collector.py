@@ -148,6 +148,7 @@ def collect_squeezellm_fisher(
     output_dir.mkdir(parents=True, exist_ok=True)
     layer_modules = _squeezellm_layer_modules(model)
     layers_per_pass = int(os.environ.get("SQUEEZELLM_FISHER_LAYERS_PER_PASS", "1"))
+    batch_size = max(1, int(os.environ.get("SQUEEZELLM_FISHER_BATCH_SIZE", "1")))
     _, _, square_grad_hook = load_squeezellm_gradients()
     accum_device = os.environ.get("SQUEEZELLM_FISHER_ACCUM_DEVICE", "gpu").lower()
     if accum_device not in {"gpu", "cpu"}:
@@ -165,7 +166,7 @@ def collect_squeezellm_fisher(
     print(
         "SqueezeLLM Fisher accumulation: "
         f"{accum_device} | gradient_checkpointing={grad_checkpointing} | "
-        f"layers_per_pass={layers_per_pass}"
+        f"layers_per_pass={layers_per_pass} | batch_size={batch_size}"
     )
     for param in model.parameters():
         param.requires_grad_(False)
@@ -212,11 +213,16 @@ def collect_squeezellm_fisher(
                 else f"{pending[0]}-{pending[-1]}"
             )
             model.zero_grad(set_to_none=True)
-            for step, data in enumerate(
-                tqdm(dataloader, desc=f"Collecting SqueezeLLM Fisher layers {group_label}"),
+            batch_starts = range(0, len(dataloader), batch_size)
+            for step, start in enumerate(
+                tqdm(batch_starts, desc=f"Collecting SqueezeLLM Fisher layers {group_label}"),
                 start=1,
             ):
-                input_ids = data[0].to(device)
+                batch_items = [
+                    item[0] if isinstance(item, (tuple, list)) else item
+                    for item in dataloader[start : start + batch_size]
+                ]
+                input_ids = torch.cat(batch_items, dim=0).to(device)
                 outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
                 outputs.loss.backward()
                 if accum_device == "cpu":

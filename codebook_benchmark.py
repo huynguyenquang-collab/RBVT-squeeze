@@ -132,6 +132,22 @@ def _execution_device(device: str) -> str:
     return device
 
 
+def _from_pretrained_with_attention(model_cls, args, kwargs):
+    if not args.attn_implementation:
+        return model_cls.from_pretrained(**kwargs)
+    try:
+        return model_cls.from_pretrained(
+            **kwargs,
+            attn_implementation=args.attn_implementation,
+        )
+    except Exception as exc:
+        print(
+            f"Falling back from attn_implementation={args.attn_implementation}: {exc}",
+            flush=True,
+        )
+        return model_cls.from_pretrained(**kwargs)
+
+
 def _model_label(model_path: str) -> str:
     name = model_path.rstrip("/").split("/")[-1]
     if name.lower() == "llama-3.1-8b":
@@ -554,14 +570,18 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
         f"max_memory={max_memory or '<unset>'} ..."
     )
     def load_model():
-        return AutoModelForCausalLM.from_pretrained(
-            args.model_path,
-            torch_dtype=dtype,
-            device_map=device_map,
-            max_memory=max_memory,
-            offload_folder=args.model_offload_folder,
-            trust_remote_code=True,
-            token=hf_token,
+        return _from_pretrained_with_attention(
+            AutoModelForCausalLM,
+            args,
+            {
+                "pretrained_model_name_or_path": args.model_path,
+                "torch_dtype": dtype,
+                "device_map": device_map,
+                "max_memory": max_memory,
+                "offload_folder": args.model_offload_folder,
+                "trust_remote_code": True,
+                "token": hf_token,
+            },
         )
 
     with tqdm(total=1, desc="Loading model", unit="step") as pbar:
@@ -892,6 +912,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-offload-folder",
         default=os.getenv("MODEL_OFFLOAD_FOLDER") or "./outputs/offload",
         help="Disk folder used by transformers when device_map offloads tensors.",
+    )
+    parser.add_argument(
+        "--attn-implementation",
+        default=os.getenv("ATTN_IMPLEMENTATION") or "flash_attention_2",
+        help="Optional HF attention implementation, with fallback if unavailable.",
     )
     parser.add_argument("--output-root", default="./outputs/codebook_benchmark")
     parser.add_argument(
