@@ -65,31 +65,10 @@ REDPAJAMA_DATASET="${REDPAJAMA_DATASET:-ZengXiangyu/RedPajama-Data-1T-Sample}"
 REDPAJAMA_STREAMING="${REDPAJAMA_STREAMING:-0}"
 export REDPAJAMA_DATASET REDPAJAMA_STREAMING
 
-# If the caller asks for one physical GPU (for example DEVICE=cuda:1), prefer
-# that GPU as logical cuda:0. By default keep the other GPU visible as spill
-# capacity for device_map=auto because Qwen 7B + 4096-token Fisher/RBVT can
-# exceed one 40GB A100 when other processes are alive.
 REQUESTED_DEVICE="$DEVICE"
-GPU_SPILL="${GPU_SPILL:-0}"
 MODEL_DEVICE_MAP="${MODEL_DEVICE_MAP:-}"
 MODEL_MAX_MEMORY="${MODEL_MAX_MEMORY:-}"
 MODEL_OFFLOAD_FOLDER="${MODEL_OFFLOAD_FOLDER:-$OUTPUT_ROOT/offload}"
-if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; then
-  requested_gpu="${BASH_REMATCH[1]}"
-  if [ "$GPU_SPILL" = "1" ] && [ "${CUDA_DEVICE_COUNT:-2}" -gt 1 ]; then
-    if [ "$requested_gpu" = "0" ]; then
-      export CUDA_VISIBLE_DEVICES="0,1"
-    else
-      export CUDA_VISIBLE_DEVICES="$requested_gpu,0"
-    fi
-    MODEL_DEVICE_MAP="${MODEL_DEVICE_MAP:-auto}"
-    MODEL_MAX_MEMORY="${MODEL_MAX_MEMORY:-0:20GiB,1:20GiB,cpu:120GiB}"
-  else
-    export CUDA_VISIBLE_DEVICES="$requested_gpu"
-    MODEL_DEVICE_MAP="${MODEL_DEVICE_MAP:-}"
-  fi
-  DEVICE="cuda:0"
-fi
 export MODEL_DEVICE_MAP MODEL_MAX_MEMORY MODEL_OFFLOAD_FOLDER
 
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
@@ -143,7 +122,6 @@ MODEL_PLACEMENT_ARGS+=(--model-offload-folder "$MODEL_OFFLOAD_FOLDER")
   echo "Requested device: $REQUESTED_DEVICE"
   echo "Runtime device: $DEVICE"
   echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
-  echo "GPU spill: $GPU_SPILL"
   echo "Model device_map: ${MODEL_DEVICE_MAP:-<single-device>}"
   echo "Model max_memory: ${MODEL_MAX_MEMORY:-<unset>}"
   echo "Model offload folder: $MODEL_OFFLOAD_FOLDER"
