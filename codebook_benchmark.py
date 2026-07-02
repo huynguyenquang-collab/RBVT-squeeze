@@ -100,8 +100,36 @@ TASK_COLUMNS = {
 }
 
 
-def _device_map(device: str):
-    return {"": device}
+def _parse_max_memory(value: str | None):
+    if not value:
+        return None
+    result = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        key, sep, memory = item.partition(":")
+        if not sep or not key or not memory:
+            raise ValueError(
+                "--model-max-memory must look like '0:34GiB,1:24GiB,cpu:120GiB'"
+            )
+        result[int(key) if key.isdigit() else key] = memory
+    return result
+
+
+def _device_map(device: str, model_device_map: str | None = None):
+    requested = model_device_map or device
+    if requested in {"auto", "balanced", "balanced_low_0", "sequential"}:
+        return requested
+    return {"": requested}
+
+
+def _execution_device(device: str) -> str:
+    if device in {"auto", "balanced", "balanced_low_0", "sequential"}:
+        return "cuda:0" if torch.cuda.is_available() else "cpu"
+    if "," in device:
+        return device.split(",", 1)[0]
+    return device
 
 
 def _model_label(model_path: str) -> str:
@@ -509,16 +537,29 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    dtype = torch.bfloat16 if args.device.startswith("cuda") else torch.float32
+    execution_device = _execution_device(args.device)
+    uses_cuda = execution_device.startswith("cuda") or args.model_device_map in {
+        "auto",
+        "balanced",
+        "balanced_low_0",
+        "sequential",
+    }
+    dtype = torch.bfloat16 if uses_cuda else torch.float32
+    device_map = _device_map(args.device, args.model_device_map)
+    max_memory = _parse_max_memory(args.model_max_memory)
     print(
         f"Loading model from {args.model_path} | "
-        f"dtype={str(dtype).replace('torch.', '')} | device={args.device} ..."
+        f"dtype={str(dtype).replace('torch.', '')} | device={args.device} | "
+        f"execution_device={execution_device} | device_map={device_map} | "
+        f"max_memory={max_memory or '<unset>'} ..."
     )
     def load_model():
         return AutoModelForCausalLM.from_pretrained(
             args.model_path,
             torch_dtype=dtype,
-            device_map=_device_map(args.device),
+            device_map=device_map,
+            max_memory=max_memory,
+            offload_folder=args.model_offload_folder,
             trust_remote_code=True,
             token=hf_token,
         )
@@ -649,7 +690,7 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
                     model=model,
                     dataloader=fisher_dataloader,
                     output_dir=fisher_path,
-                    device=args.device,
+                    device=execution_device,
                 )
                 del fisher_dataloader
             sensitivity_path = str(fisher_path)
@@ -700,7 +741,7 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
             tokenizer=tokenizer,
             linears=linears,
             calib_texts=calibration_texts,
-            device=args.device,
+            device=execution_device,
             n_calib=args.n_calib,
             max_length=args.max_length,
             want_var=args.rbvt_lambda > 0.0,
@@ -718,7 +759,7 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
             codebook=codebook,
             codebook_store=codebook_store,
             calib_texts=calibration_texts,
-            device=args.device,
+            device=execution_device,
             skip_lmhead=args.skip_lmhead,
             n_calib=args.n_calib,
             max_length=args.max_length,
@@ -836,6 +877,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model-path", default=DEFAULT_MODEL)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--model-device-map",
+        choices=["auto", "balanced", "balanced_low_0", "sequential"],
+        default=os.getenv("MODEL_DEVICE_MAP") or None,
+        help="Optional Hugging Face device_map for model sharding/offload.",
+    )
+    parser.add_argument(
+        "--model-max-memory",
+        default=os.getenv("MODEL_MAX_MEMORY") or None,
+        help="Optional max_memory, e.g. '0:34GiB,1:24GiB,cpu:120GiB'.",
+    )
+    parser.add_argument(
+        "--model-offload-folder",
+        default=os.getenv("MODEL_OFFLOAD_FOLDER") or "./outputs/offload",
+        help="Disk folder used by transformers when device_map offloads tensors.",
+    )
     parser.add_argument("--output-root", default="./outputs/codebook_benchmark")
     parser.add_argument(
         "--codebooks",
