@@ -52,6 +52,40 @@ def _squeezellm_linears(model) -> list[tuple[str, nn.Linear]]:
     return result
 
 
+def _squeezellm_layer_modules(model) -> list[list[tuple[str, nn.Linear]]]:
+    if not hasattr(model, "model") or not hasattr(model.model, "layers"):
+        raise TypeError("SqueezeLLM Fisher collection currently requires a Llama-style model")
+    model_parse = load_squeezellm_model_parse()
+    names = model_parse.get_sequential("llama")
+    _, get_modules, _ = load_squeezellm_gradients()
+    result = []
+    for layer_index, layer in enumerate(model.model.layers):
+        modules = get_modules(layer)
+        if len(names) != len(modules):
+            raise RuntimeError(
+                "SqueezeLLM and SqueezeLLM-gradients disagree on Llama layer count: "
+                f"{len(names)} names != {len(modules)} modules"
+            )
+        layer_modules = []
+        for relative_name, module in zip(names, modules):
+            if not isinstance(module, nn.Linear):
+                raise TypeError(
+                    f"Expected Linear at model.layers.{layer_index}.{relative_name}"
+                )
+            layer_modules.append((f"model.layers.{layer_index}.{relative_name}", module))
+        result.append(layer_modules)
+    return result
+
+
+def _layer_groups(layer_count: int, layers_per_pass: int) -> list[list[int]]:
+    if layers_per_pass <= 0:
+        return [list(range(layer_count))]
+    return [
+        list(range(start, min(start + layers_per_pass, layer_count)))
+        for start in range(0, layer_count, layers_per_pass)
+    ]
+
+
 def load_squeezellm_fisher_data(
     model_path: str,
     tokenizer=None,
@@ -107,62 +141,117 @@ def collect_squeezellm_fisher(
             return output_dir
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    linears = _squeezellm_linears(model)
+    layer_modules = _squeezellm_layer_modules(model)
+    layers_per_pass = int(os.environ.get("SQUEEZELLM_FISHER_LAYERS_PER_PASS", "1"))
     _, _, square_grad_hook = load_squeezellm_gradients()
-    handles = [
-        module.weight.register_hook(square_grad_hook)
-        for _, module in linears
-    ]
     accum_device = os.environ.get("SQUEEZELLM_FISHER_ACCUM_DEVICE", "gpu").lower()
     if accum_device not in {"gpu", "cpu"}:
         raise ValueError("SQUEEZELLM_FISHER_ACCUM_DEVICE must be 'gpu' or 'cpu'")
     grad_checkpointing = _env_flag("SQUEEZELLM_FISHER_GRAD_CHECKPOINTING", "0")
-    cpu_accum = None
-    if accum_device == "cpu":
-        cpu_accum = {
-            layer_name: torch.zeros_like(module.weight, dtype=torch.float32, device="cpu")
-            for layer_name, module in linears
-        }
     if hasattr(model, "config"):
         model.config.use_cache = False
     if grad_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
         model.gradient_checkpointing_enable()
     print(
         "SqueezeLLM Fisher accumulation: "
-        f"{accum_device} | gradient_checkpointing={grad_checkpointing}"
+        f"{accum_device} | gradient_checkpointing={grad_checkpointing} | "
+        f"layers_per_pass={layers_per_pass}"
     )
+    for param in model.parameters():
+        param.requires_grad_(False)
     model.train()
-    model.zero_grad(set_to_none=True)
 
+    layers = {}
     try:
-        for step, data in enumerate(tqdm(dataloader, desc="Collecting SqueezeLLM Fisher"), start=1):
-            input_ids = data[0].to(device)
-            outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
-            outputs.loss.backward()
-            if cpu_accum is not None:
-                for layer_name, module in linears:
-                    if module.weight.grad is None:
-                        raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
-                    cpu_accum[layer_name].add_(module.weight.grad.detach().float().cpu())
+        for group in _layer_groups(len(layer_modules), layers_per_pass):
+            pending = []
+            for layer_idx in group:
+                expected = [
+                    output_dir / f"{layer_name.replace('.', '_')}.pt"
+                    for layer_name, _ in layer_modules[layer_idx]
+                ]
+                if all(path.exists() for path in expected):
+                    print(f"Skipping existing Fisher layer {layer_idx}")
+                    continue
+                pending.append(layer_idx)
+            if not pending:
+                continue
+
+            selected = []
+            handles = []
+            cpu_accum = {}
+            try:
+                for layer_idx in pending:
+                    for layer_name, module in layer_modules[layer_idx]:
+                        module.weight.requires_grad_(True)
+                        module.weight.grad = None
+                        selected.append((layer_name, module))
+                        if accum_device == "cpu":
+                            cpu_accum[layer_name] = torch.zeros_like(
+                                module.weight,
+                                dtype=torch.float32,
+                                device="cpu",
+                            )
+
+                            def make_cpu_hook(target_name):
+                                def hook(grad):
+                                    cpu_accum[target_name].add_(grad.detach().float().cpu().square())
+                                    return torch.zeros_like(grad)
+
+                                return hook
+
+                            handles.append(module.weight.register_hook(make_cpu_hook(layer_name)))
+                        else:
+                            handles.append(module.weight.register_hook(square_grad_hook))
+
+                group_label = (
+                    str(pending[0])
+                    if len(pending) == 1
+                    else f"{pending[0]}-{pending[-1]}"
+                )
+                model.zero_grad(set_to_none=True)
+                for step, data in enumerate(
+                    tqdm(dataloader, desc=f"Collecting SqueezeLLM Fisher layers {group_label}"),
+                    start=1,
+                ):
+                    input_ids = data[0].to(device)
+                    outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
+                    outputs.loss.backward()
+                    if accum_device == "cpu":
+                        for _, module in selected:
+                            module.weight.grad = None
+                        model.zero_grad(set_to_none=True)
+                    del input_ids, outputs
+                    if torch.cuda.is_available() and step % 32 == 0:
+                        torch.cuda.empty_cache()
+
+                for layer_name, module in selected:
+                    if accum_device == "cpu":
+                        fisher = cpu_accum[layer_name]
+                    else:
+                        if module.weight.grad is None:
+                            raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
+                        fisher = module.weight.grad.detach().float().cpu()
+                    filename = layer_name.replace(".", "_") + ".pt"
+                    torch.save(fisher, output_dir / filename)
+                    layers[f"{layer_name}.weight"] = filename
+            finally:
+                for handle in handles:
+                    handle.remove()
+                for _, module in selected:
+                    module.weight.requires_grad_(False)
                     module.weight.grad = None
                 model.zero_grad(set_to_none=True)
-            del input_ids, outputs
-            if torch.cuda.is_available() and step % 8 == 0:
-                torch.cuda.empty_cache()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
     finally:
-        for handle in handles:
-            handle.remove()
         if grad_checkpointing and hasattr(model, "gradient_checkpointing_disable"):
             model.gradient_checkpointing_disable()
 
-    layers = {}
-    for layer_name, module in linears:
-        if cpu_accum is None and module.weight.grad is None:
-            raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
-        filename = layer_name.replace(".", "_") + ".pt"
-        fisher = cpu_accum[layer_name] if cpu_accum is not None else module.weight.grad.detach().float().cpu()
-        torch.save(fisher, output_dir / filename)
-        layers[f"{layer_name}.weight"] = filename
+    for layer in layer_modules:
+        for layer_name, _ in layer:
+            filename = layer_name.replace(".", "_") + ".pt"
+            layers.setdefault(f"{layer_name}.weight", filename)
     model.zero_grad(set_to_none=True)
 
     manifest_path.write_text(
