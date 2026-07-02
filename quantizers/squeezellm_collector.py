@@ -109,24 +109,41 @@ def collect_squeezellm_fisher(
         module.weight.register_hook(square_grad_hook)
         for _, module in linears
     ]
+    cpu_accum = {
+        layer_name: torch.zeros_like(module.weight, dtype=torch.float32, device="cpu")
+        for layer_name, module in linears
+    }
+    if hasattr(model, "config"):
+        model.config.use_cache = False
+    if hasattr(model, "gradient_checkpointing_enable"):
+        model.gradient_checkpointing_enable()
     model.train()
     model.zero_grad(set_to_none=True)
 
     try:
-        for data in tqdm(dataloader, desc="Collecting SqueezeLLM Fisher"):
+        for step, data in enumerate(tqdm(dataloader, desc="Collecting SqueezeLLM Fisher"), start=1):
             input_ids = data[0].to(device)
-            outputs = model(input_ids=input_ids, labels=input_ids)
+            outputs = model(input_ids=input_ids, labels=input_ids, use_cache=False)
             outputs.loss.backward()
+            for layer_name, module in linears:
+                if module.weight.grad is None:
+                    raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
+                cpu_accum[layer_name].add_(module.weight.grad.detach().float().cpu())
+                module.weight.grad = None
+            model.zero_grad(set_to_none=True)
+            del input_ids, outputs
+            if torch.cuda.is_available() and step % 8 == 0:
+                torch.cuda.empty_cache()
     finally:
         for handle in handles:
             handle.remove()
+        if hasattr(model, "gradient_checkpointing_disable"):
+            model.gradient_checkpointing_disable()
 
     layers = {}
     for layer_name, module in linears:
-        if module.weight.grad is None:
-            raise RuntimeError(f"No Fisher gradient collected for {layer_name}")
         filename = layer_name.replace(".", "_") + ".pt"
-        torch.save(module.weight.grad.detach().float().cpu(), output_dir / filename)
+        torch.save(cpu_accum[layer_name], output_dir / filename)
         layers[f"{layer_name}.weight"] = filename
     model.zero_grad(set_to_none=True)
 

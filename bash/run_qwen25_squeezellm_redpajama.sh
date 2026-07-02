@@ -79,7 +79,7 @@ if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; the
     else
       export CUDA_VISIBLE_DEVICES="$requested_gpu,0"
     fi
-    MODEL_MAX_MEMORY="${MODEL_MAX_MEMORY:-0:34GiB,1:24GiB,cpu:120GiB}"
+    MODEL_MAX_MEMORY="${MODEL_MAX_MEMORY:-0:24GiB,1:24GiB,cpu:120GiB}"
   else
     export CUDA_VISIBLE_DEVICES="$requested_gpu"
     MODEL_DEVICE_MAP="${MODEL_DEVICE_MAP:-}"
