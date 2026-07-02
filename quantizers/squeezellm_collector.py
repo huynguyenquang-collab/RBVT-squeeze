@@ -22,6 +22,7 @@ from .upstream_imports import (
     load_squeezellm_model_parse,
     load_squeezellm_remove_outliers,
 )
+from calibration_utils import get_redpajama_calibration_data
 
 
 def _squeezellm_linears(model) -> list[tuple[str, nn.Linear]]:
@@ -49,11 +50,32 @@ def _squeezellm_linears(model) -> list[tuple[str, nn.Linear]]:
 
 def load_squeezellm_fisher_data(
     model_path: str,
+    tokenizer=None,
+    dataset_name: str = "c4",
     num_examples: int = 100,
     sequence_length: int = 512,
+    seed: int = 0,
+    cache_dir: str | Path = "./calibration_cache",
 ):
-    """Call SqueezeLLM-gradients/datautils.py::get_loaders directly."""
+    """Load Fisher calibration tokens for SqueezeLLM sensitivity collection."""
 
+    dataset_name = dataset_name.lower()
+    if dataset_name in {"redpajama", "red_pajama"}:
+        if tokenizer is None:
+            raise ValueError("tokenizer is required for RedPajama SqueezeLLM Fisher calibration")
+        tokens = get_redpajama_calibration_data(
+            tokenizer=tokenizer,
+            n_samples=num_examples,
+            seqlen=sequence_length,
+            seed=seed,
+            return_tensors=True,
+            cache_dir=cache_dir,
+        )
+        return [(item,) for item in tokens]
+    if dataset_name != "c4":
+        raise ValueError(f"Unsupported SqueezeLLM Fisher dataset: {dataset_name}")
+
+    # Preserve the original upstream C4 loader path by default.
     get_loaders, _, _ = load_squeezellm_gradients()
     dataloader, _ = get_loaders(
         "c4",

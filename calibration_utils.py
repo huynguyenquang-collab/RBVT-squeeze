@@ -7,6 +7,7 @@ NCCQuant at runtime.
 
 from __future__ import annotations
 
+import os
 import pickle
 import random
 from pathlib import Path
@@ -24,7 +25,7 @@ def get_c4_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=42, retu
     print(f"  Seed: {seed}")
 
     cache_path = Path(cache_dir)
-    cache_path.mkdir(exist_ok=True)
+    cache_path.mkdir(parents=True, exist_ok=True)
 
     cache_file = cache_path / f"c4_calib_n{n_samples}_len{seqlen}_seed{seed}_tensors{return_tensors}.pkl"
     if cache_file.exists():
@@ -135,10 +136,96 @@ def get_wikitext2_calibration_data(tokenizer, n_samples=128, seqlen=2048, seed=4
     return calibration_texts
 
 
+def _redpajama_text(example):
+    for key in ("text", "raw_content", "content"):
+        value = example.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def get_redpajama_calibration_data(
+    tokenizer,
+    n_samples=1024,
+    seqlen=4096,
+    seed=0,
+    split="train",
+    return_tensors=False,
+    cache_dir="./calibration_cache",
+):
+    dataset_name = os.environ.get("REDPAJAMA_DATASET", "ZengXiangyu/RedPajama-Data-1T-Sample")
+    dataset_config = os.environ.get("REDPAJAMA_CONFIG") or None
+    streaming = os.environ.get("REDPAJAMA_STREAMING", "0") == "1"
+
+    print(f"\n[RedPajama Calibration Data]")
+    print(f"  Dataset: {dataset_name}")
+    print(f"  Config: {dataset_config or '<none>'}")
+    print(f"  Split: {split}")
+    print(f"  Samples: {n_samples}")
+    print(f"  Sequence length: {seqlen} tokens")
+    print(f"  Seed: {seed}")
+
+    cache_path = Path(cache_dir)
+    cache_path.mkdir(exist_ok=True)
+    safe_dataset = dataset_name.replace("/", "__")
+    safe_config = dataset_config or "default"
+    cache_file = cache_path / (
+        f"redpajama_{safe_dataset}_{safe_config}_n{n_samples}_len{seqlen}_seed{seed}_split{split}_"
+        f"tensors{return_tensors}.pkl"
+    )
+    if cache_file.exists():
+        print(f"\n  Loading from cache: {cache_file}")
+        with open(cache_file, "rb") as f:
+            return pickle.load(f)
+
+    print("\n  No cache found, loading RedPajama...")
+    rng = random.Random(seed)
+    if dataset_config is None:
+        data = load_dataset(dataset_name, split=split, streaming=streaming)
+    else:
+        data = load_dataset(dataset_name, dataset_config, split=split, streaming=streaming)
+
+    calibration_texts = []
+    skipped = 0
+    for item in data:
+        text = _redpajama_text(item)
+        if not text:
+            skipped += 1
+            continue
+        encoded = tokenizer(text, return_tensors="pt", add_special_tokens=False)["input_ids"][0]
+        if encoded.numel() < seqlen:
+            skipped += 1
+            continue
+        start = rng.randint(0, encoded.numel() - seqlen)
+        chunk = encoded[start : start + seqlen]
+        if return_tensors:
+            calibration_texts.append(chunk.unsqueeze(0).to(torch.long))
+        else:
+            calibration_texts.append(tokenizer.decode(chunk, skip_special_tokens=True))
+        if len(calibration_texts) % 32 == 0:
+            print(f"    Collected {len(calibration_texts)}/{n_samples} samples (skipped {skipped})...")
+        if len(calibration_texts) >= n_samples:
+            break
+
+    if len(calibration_texts) != n_samples:
+        raise RuntimeError(
+            f"Collected only {len(calibration_texts)} RedPajama samples; expected {n_samples}. "
+            "Try REDPAJAMA_STREAMING=1 or another REDPAJAMA_DATASET/REDPAJAMA_CONFIG."
+        )
+
+    print(f"  Collected {len(calibration_texts)} samples from RedPajama")
+    print(f"  Saving to cache: {cache_file}")
+    with open(cache_file, "wb") as f:
+        pickle.dump(calibration_texts, f)
+    return calibration_texts
+
+
 def load_calibration_data(dataset_name, tokenizer, n_samples=128, seqlen=2048, seed=42, cache_dir="./calibration_cache"):
     dataset_name = dataset_name.lower()
     if dataset_name == "c4":
         return get_c4_calibration_data(tokenizer, n_samples, seqlen, seed, cache_dir=cache_dir)
     if dataset_name in ["wikitext2", "wikitext"]:
         return get_wikitext2_calibration_data(tokenizer, n_samples, seqlen, seed, split="train", cache_dir=cache_dir)
-    raise ValueError(f"Unknown dataset: {dataset_name}. Use 'c4' or 'wikitext2'")
+    if dataset_name in ["redpajama", "red_pajama"]:
+        return get_redpajama_calibration_data(tokenizer, n_samples, seqlen, seed, split="train", cache_dir=cache_dir)
+    raise ValueError(f"Unknown dataset: {dataset_name}. Use 'c4', 'wikitext2', or 'redpajama'")

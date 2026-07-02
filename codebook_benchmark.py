@@ -609,12 +609,18 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
     else:
         sensitivity_path = args.squeezellm_sensitivity
         if sensitivity_path is None:
+            fisher_dataset = args.squeezellm_fisher_dataset.lower()
+            fisher_tag = (
+                "c4"
+                if fisher_dataset == "c4"
+                else fisher_dataset.replace("_", "-")
+            )
             fisher_path = (
                 cache_root
                 / "fisher"
                 / model_slug
                 / (
-                    f"c4_n{args.squeezellm_fisher_samples}"
+                    f"{fisher_tag}_n{args.squeezellm_fisher_samples}"
                     f"_len{args.squeezellm_fisher_length}_seed0"
                     "_gradients_5f2a166"
                 )
@@ -632,8 +638,12 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
                 )
                 fisher_dataloader = load_squeezellm_fisher_data(
                     model_path=args.model_path,
+                    tokenizer=tokenizer,
+                    dataset_name=args.squeezellm_fisher_dataset,
                     num_examples=args.squeezellm_fisher_samples,
                     sequence_length=args.squeezellm_fisher_length,
+                    seed=0,
+                    cache_dir=cache_root / "calibration",
                 )
                 collect_squeezellm_fisher(
                     model=model,
@@ -676,6 +686,7 @@ def run_one(args, codebook_name: str, bits: int, method: str) -> dict:
             n_samples=args.n_calib,
             seqlen=args.max_length,
             seed=args.seed,
+            cache_dir=cache_root / "calibration",
         )
     if method == "rbvt":
         linears = [
@@ -850,7 +861,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     parser.add_argument("--skip-lmhead", action="store_true", default=True)
     parser.add_argument("--no-skip-lmhead", dest="skip_lmhead", action="store_false")
-    parser.add_argument("--calib-dataset", choices=["c4", "wikitext2"], default="c4")
+    parser.add_argument("--calib-dataset", choices=["c4", "wikitext2", "redpajama"], default="c4")
     parser.add_argument("--n-calib", type=int, default=128)
     parser.add_argument("--max-length", type=int, default=2048)
     parser.add_argument("--seed", type=int, default=42)
@@ -896,6 +907,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--squeezellm-fisher-samples", type=int, default=100)
     parser.add_argument("--squeezellm-fisher-length", type=int, default=512)
+    parser.add_argument(
+        "--squeezellm-fisher-dataset",
+        choices=["c4", "redpajama"],
+        default="c4",
+        help="Calibration dataset for collecting SqueezeLLM Fisher sensitivity. Default preserves existing C4 behavior.",
+    )
     parser.add_argument(
         "--squeezellm-mode",
         choices=["dense-only", "hybrid"],
@@ -984,7 +1001,7 @@ def main():
         "Upstream codebook statistics: "
         f"LeanQuant=C4/{args.n_calib}x{args.max_length}, seed=0, "
         "true-sequential full Hessian; "
-        f"SqueezeLLM=C4/{args.squeezellm_fisher_samples}x"
+        f"SqueezeLLM={args.squeezellm_fisher_dataset}/{args.squeezellm_fisher_samples}x"
         f"{args.squeezellm_fisher_length}, Fisher seed=0, "
         f"mode={args.squeezellm_mode}"
         + (
