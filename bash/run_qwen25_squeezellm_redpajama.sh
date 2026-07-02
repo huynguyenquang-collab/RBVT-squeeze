@@ -61,6 +61,15 @@ WANDB_ENTITY="${WANDB_ENTITY:-}"
 REDPAJAMA_DATASET="${REDPAJAMA_DATASET:-ZengXiangyu/RedPajama-Data-1T-Sample}"
 REDPAJAMA_STREAMING="${REDPAJAMA_STREAMING:-0}"
 export REDPAJAMA_DATASET REDPAJAMA_STREAMING
+
+# If the caller asks for one physical GPU (for example DEVICE=cuda:1), hide the
+# rest so any upstream cuda:0 defaults still land on that selected GPU.
+REQUESTED_DEVICE="$DEVICE"
+if [ -z "${CUDA_VISIBLE_DEVICES:-}" ] && [[ "$DEVICE" =~ ^cuda:([0-9]+)$ ]]; then
+  export CUDA_VISIBLE_DEVICES="${BASH_REMATCH[1]}"
+  DEVICE="cuda:0"
+fi
+
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
@@ -98,7 +107,9 @@ fi
 {
   echo "=== Qwen2.5 SqueezeLLM RedPajama benchmark ==="
   echo "Model: $MODEL"
-  echo "Device: $DEVICE"
+  echo "Requested device: $REQUESTED_DEVICE"
+  echo "Runtime device: $DEVICE"
+  echo "CUDA_VISIBLE_DEVICES: ${CUDA_VISIBLE_DEVICES:-<unset>}"
   echo "Bits: $BIT"
   echo "Methods: $METHODS"
   echo "RBVT calibration: redpajama/${N_CALIB}x${MAX_LENGTH}, seed=$SEED"
